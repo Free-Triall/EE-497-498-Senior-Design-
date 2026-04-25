@@ -82,7 +82,7 @@ float voltsToTDSppm(float v, float waterTempC = 25.0f) {
 // Website Pump button added 4/11/2025
 void checkPumpState() {
   HTTPClient http;
-  http.begin("http://192.168.4.20:5000/pump/state"");
+  http.begin("http://192.168.4.20:5000/pump/state");
   int code = http.GET();
   if (code == 200) {
     String body = http.getString();
