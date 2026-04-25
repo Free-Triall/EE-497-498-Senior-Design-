@@ -2,38 +2,51 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "DHT.h" //Calling device DHT.h
+#include <OneWire.h>           // Salinity DS18B20 temp sensor added 4/25/2026
+#include <DallasTemperature.h> // Salinity DS18B20 temp sensor added 4/25/2026
+#include <math.h>              // Salinity math added 4/25/2026
 
-// Salinity Sensor Stuff added 3/20/2026 might delete
-//#include <Wire.h>
-//#include <LiquidCrystal_I2C.h>
-//#include <OneWire.h>
-//#include <DallasTemperature.h>
+//DHT libs and pins
+#define DHTPIN 4     
+#define DHTTYPE DHT22 // previously DHT11 but its a different model  
 
-#define DHTPIN 4 
-// previously DHT11 but its a different model       
-#define DHTTYPE DHT22 
+//Pump Pins 
 #define PUMP_PIN 18 // added 2/20/2026  
+#define PUMP_PIN_2 13 // added 4/10/2026 || second pump
 
+//HC-SR04 pins
+#define TRIG_PIN 26 // added 4/12/26
+#define ECHO_PIN 27 // added 4/12/26
+#define WATER_LOW_CM 15.0  // adjust this after irl tests // added 4/12/26
 
-// TDS Sensor Stuff added 11/15/2025
-const int TDS_PIN = 34;
+const int TDS_PIN = 34; // TDS Sensor Stuff added 11/15/2025
 
-// Salinity Sensor Stuff added 3/20/2026
-//const int salinityAnalogPin = 35;
-//const int salinityDrivePin1 = 25;
-//const int salinityDrivePin2 = 26;
-//#define ONE_WIRE_BUS 14
-//OneWire oneWire(ONE_WIRE_BUS);
-//DallasTemperature sensors(&oneWire);
+// Salinity Sensor Pins added 4/25/2026
+#define SAL_DRIVE_A    25  // AC drive pin A
+#define SAL_DRIVE_B    33  // AC drive pin B
+#define SAL_ANALOG_PIN 32  // analog read pin
+#define ONE_WIRE_BUS   23  // DS18B20 data pin
 
 //Wifi Login
-const char* ssid = "w";
-const char* password = "w";
+const char* ssid = "Straw Hat Crew";
+const char* password = "";
 
 //My FLASK server
-const char* serverURL = "w"; // Flask IP address
+const char* serverURL = "http://192.168.4.20:5000/ingest";
 
 DHT dht(DHTPIN, DHTTYPE);
+
+// Salinity sensor objects added 4/25/2026
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature salinityTempSensor(&oneWire);
+
+// Salinity measurement variables added 4/25/2026
+int   sal_dtime      = 300;   // microseconds per AC half-cycle
+float sal_Vin        = 3.3;
+float sal_R1         = 1000.0;
+int   sal_samples    = 5000;
+float sal_CalTemp    = 21.0;  // reference temp for correction
+float sal_CorrFactor = 1.02;  // adjust after irl testing
 
 // TDS Sensor Stuff added 11/15/2025
 // average ADC readings and convert to volts
@@ -66,76 +79,110 @@ float voltsToTDSppm(float v, float waterTempC = 25.0f) {
   return tds; // ppm
 }
 
-// TDS Sensor Stuff added 11/15/2025
+// Website Pump button added 4/11/2025
+void checkPumpState() {
+  HTTPClient http;
+  http.begin("http://192.168.4.20:5000/pump/state"");
+  int code = http.GET();
+  if (code == 200) {
+    String body = http.getString();
+    // simple string checks, no JSON library needed
+    bool fillerOn  = body.indexOf("\"filler\": true")  != -1 || body.indexOf("\"filler\":true")  != -1;
+    bool suctionOn = body.indexOf("\"suction\": true") != -1 || body.indexOf("\"suction\":true") != -1;
+    digitalWrite(PUMP_PIN,   fillerOn  ? HIGH : LOW);
+    digitalWrite(PUMP_PIN_2, suctionOn ? HIGH : LOW);
+  }
+  http.end();
+}
 
-// LCD Salinity Sensor Stuff added 3/24/2026
-//LiquidCrystal_I2C lcd(0x27, 16, 2);
+//Water level stuff // added 4/12/26
+float readWaterDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return -1;
+  return (duration * 0.0343) / 2.0;
+}
 
-// Salinity Sensor Stuff added 3/20/2026
-//float measureSalinityResistance(int samples = 5000) { 
-  //const int dtime = 500;
-  //const float Vin = 3.3;
-  //const float R1 = 1000.0;
+// Salinity read function added 4/25/2026
+// returns corrected resistance in Ohms, or -1 on failure
+float readSalinityOhm() {
+  float tot        = 0;
+  int validSamples = 0;
 
-  //float tot = 0;
-  //int validSamples = 0;
+  for (int i = 0; i < sal_samples; i++) {
+    digitalWrite(SAL_DRIVE_A, HIGH);
+    digitalWrite(SAL_DRIVE_B, LOW);
+    delayMicroseconds(sal_dtime);
+    digitalWrite(SAL_DRIVE_A, LOW);
+    digitalWrite(SAL_DRIVE_B, HIGH);
+    delayMicroseconds(sal_dtime);
 
-// Salinity Sensor Stuff added 3/20/2026
-  //for (int i = 0; i < samples; i++) {
-  //  digitalWrite(salinityDrivePin1, HIGH);
-  //  digitalWrite(salinityDrivePin2, LOW);
-  //  delayMicroseconds(dtime);
+    int raw = analogRead(SAL_ANALOG_PIN);
+    if (raw > 0 && raw < 4095) {
+      float vout = (raw * sal_Vin) / 4095.0;
+      if (vout > 0.001) {
+        float r2 = sal_R1 * ((sal_Vin / vout) - 1.0);
+        tot += r2;
+        validSamples++;
+      }
+    }
+  }
 
-  //  digitalWrite(salinityDrivePin1, LOW);
-  //  digitalWrite(salinityDrivePin2, HIGH);
-  //  delayMicroseconds(dtime);
+  if (validSamples == 0) return -1;
 
-  //  int raw = analogRead(salinityAnalogPin);
+  // temperature correction using DS18B20 added 4/25/2026
+  salinityTempSensor.requestTemperatures();
+  float waterTempC = salinityTempSensor.getTempCByIndex(0);
+  float avg = (tot / validSamples) * pow(sal_CorrFactor, waterTempC - sal_CalTemp);
 
-  //  if (raw > 0) {
-  //    float Vout = (raw / 4095.0) * Vin;
-  //    if (Vout > 0.001 && Vout < Vin) {
-  //      float buffer = (Vin / Vout) - 1.0;
-  //      float R2 = R1 * buffer;
-  //      tot += R2;
-  //      validSamples++;
-  //    }
-  //  }
-  //}
+  return avg;
+}
 
-  //if (validSamples == 0) return -1.0;
-  //return tot / validSamples;
-//} // Salinity Sensor Stuff added 3/20/2026
+// Salinity label helper added 4/25/2026
+String salinityType(float resistance) {
+  if      (resistance > 5000) return "Demineralised";
+  else if (resistance > 800)  return "Tap/Fresh";
+  else if (resistance > 100)  return "Brackish";
+  else                        return "Seawater";
+}
 
 //getting into the net
 void setup() {
-  //sensors.begin(); //aded today
+ 
+  // Water level stuff added 4/12/26
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
+  //DHT22
   Serial.begin(115200);
   dht.begin();
   delay(2000);
-
-  // LCD Salinity Sensor Stuff added 3/24/2026
-  //Wire.begin(22, 23);
-  //lcd.init();
-  //lcd.backlight();
-  //lcd.clear();
-  //lcd.setCursor(0, 0);
-  //lcd.print("Starting...");
 
   // Pump Stuff added 2/20/2026
   pinMode(PUMP_PIN, OUTPUT); // added 2/20/2026
   //digitalWrite(PUMP_PIN, HIGH); // added 2/20/2026
   //delay(5000); // added 2/20/2026
   //digitalWrite(PUMP_PIN, LOW); // added 2/20/2026
+  
+  //Pump 2 added 4/10/26
+  pinMode(PUMP_PIN_2, OUTPUT); // added 4/10/2026
+  //digitalWrite(PUMP_PIN_2, HIGH);
+  //delay(5000);
+  //digitalWrite(PUMP_PIN_2, LOW);
 
   // TDS Sensor Stuff added 11/15/2025
   analogReadResolution(12);                    // 0–4095 // TDS Sensor Stuff added 11/15/2025
   analogSetPinAttenuation(TDS_PIN, ADC_11db);  // up to ~3.3 V // TDS Sensor Stuff added 11/15/2025
 
-  //analogSetPinAttenuation(salinityAnalogPin, ADC_11db); // Salinity Sensor Stuff added 3/20/2026
-  //pinMode(salinityDrivePin1, OUTPUT); // Salinity Sensor Stuff added 3/20/2026
-  //pinMode(salinityDrivePin2, OUTPUT); // Salinity Sensor Stuff added 3/20/2026
+  // Salinity sensor setup added 4/25/2026
+  pinMode(SAL_DRIVE_A, OUTPUT); // added 4/25/2026
+  pinMode(SAL_DRIVE_B, OUTPUT); // added 4/25/2026
+  salinityTempSensor.begin();   // added 4/25/2026
+  analogSetPinAttenuation(SAL_ANALOG_PIN, ADC_11db); // up to ~3.3 V // added 4/25/2026
 
   Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
@@ -163,28 +210,11 @@ void loop() {
     float tdsVoltage = readAveragedVoltage(TDS_PIN); // TDS Sensor Stuff added 11/15/2025
     float tdsPPM = voltsToTDSppm(tdsVoltage, tempC); // TDS Sensor Stuff added 11/15/2025
 
-    // Salinity Sensor Stuff added 3/20/2026
-    //float salinityResistance = measureSalinityResistance(); // Salinity Sensor Stuff added 3/20/2026
-
-    // LCD Salinity Sensor Stuff added 3/20/2026
-    //lcd.clear();
-
-    //lcd.setCursor(0, 0);
-    //lcd.print("S:");
-    //lcd.print(salinityResistance, 0);
-    //lcd.print(" ohm");
-
-    //lcd.setCursor(0, 1);
-    //lcd.print("T:");
-    //lcd.print(tempC, 1);
-    //lcd.print(" C");
-
-    //Serial.print("TDS: "); // probably delete
-    //Serial.print(tdsPPM, 1); // probably delete
-    //Serial.print("  Salinity Resistance: "); // Salinity Sensor Stuff added 3/20/2026
-    //Serial.print(salinityResistance, 1); // Salinity Sensor Stuff added 3/20/2026
-    //Serial.println(" ohms"); // Salinity Sensor Stuff added 3/20/2026
-    //Serial.println(analogRead(35)); // added today 
+    float waterDistCM = readWaterDistanceCM(); // HC-SR04 stuff added 4/12/2026
+    bool waterLow = (waterDistCM > WATER_LOW_CM || waterDistCM < 0); // HC-SR04 stuff added 4/12/2026
+    Serial.print("Water Distance: "); // HC-SR04 stuff added 4/12/2026
+    Serial.print(waterDistCM); // HC-SR04 stuff added 4/12/2026
+    Serial.println(" cm"); // HC-SR04 stuff added 4/12/2026
     
     Serial.print("Temp C: "); // TDS Sensor Stuff added 11/15/2025
     Serial.print(tempC, 2); // TDS Sensor Stuff added 11/15/2025
@@ -196,6 +226,22 @@ void loop() {
     Serial.print(tdsPPM, 1); // TDS Sensor Stuff added 11/15/2025
     Serial.println(" ppm"); // TDS Sensor Stuff added 11/15/2025
 
+    // Salinity added 4/25/2026
+    float salinityOhm    = readSalinityOhm(); // added 4/25/2026
+    String salinityLabel = salinityType(salinityOhm); // added 4/25/2026
+
+    // Water temp from DS18B20 for dashboard added 4/25/2026
+    salinityTempSensor.requestTemperatures(); // added 4/25/2026
+    float waterTempC = salinityTempSensor.getTempCByIndex(0); // added 4/25/2026
+
+    Serial.print("Salinity Resistance: "); // added 4/25/2026
+    Serial.print(salinityOhm); // added 4/25/2026
+    Serial.print(" Ohm  Type: "); // added 4/25/2026
+    Serial.println(salinityLabel); // added 4/25/2026
+    Serial.print("Water Temp: "); // added 4/25/2026
+    Serial.print(waterTempC, 2); // added 4/25/2026
+    Serial.println(" C"); // added 4/25/2026
+
     // Build JSON payload
     String payload = "{";
     payload += "\"device_id\":\"esp32_dht22\",";
@@ -203,8 +249,13 @@ void loop() {
     payload += "\"readings\":{";
     payload += "\"temp_c\":" + String(tempC, 2) + ",";
     payload += "\"moisture\":" + String(humidity, 2) + ",";
-    payload += "\"ph\":null,"; // comma added at the end 11/15/2025
+    //payload += "\"ph\":null,"; // comma added at the end 11/15/2025
     payload += "\"tds_ppm\":" + String(tdsPPM, 1); // TDS Sensor Stuff added 11/15/2025
+    payload += ",\"water_dist_cm\":" + String(waterDistCM, 1); // HC-SR04 stuff added 4/12/2026
+    payload += ",\"water_low\":" + String(waterLow ? "true" : "false"); // HC-SR04 stuff added 4/12/2026
+    payload += ",\"salinity_ohm\":" + String(salinityOhm, 1); // added 4/25/2026
+    payload += ",\"salinity_type\":\"" + salinityLabel + "\""; // added 4/25/2026
+    payload += ",\"water_temp_c\":" + String(waterTempC, 2); // added 4/25/2026
     payload += "}}";
 
     Serial.println("Posting data to server...");
@@ -226,6 +277,7 @@ void loop() {
     }
 
     http.end();
+    checkPumpState(); //added 4/11/26
   } else {
     Serial.println("WiFi disconnected, retrying...");
     WiFi.reconnect();
